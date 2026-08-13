@@ -1,0 +1,4 @@
+# Test bench. The simulator needs the same crypto the client uses; the Home
+# Assistant harness pins its own Home Assistant version.
+broadlink==0.19.0
+pytest-homeassistant-custom-component

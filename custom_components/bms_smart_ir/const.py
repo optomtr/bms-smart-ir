@@ -41,6 +41,47 @@ DEVICE_TYPE_CLIMATE = "climate"
 DEVICE_TYPE_MEDIA_PLAYER = "media_player"
 CONTROLLER_BROADLINK = "Broadlink"
 DEFAULT_TIMEOUT = 5
+DEFAULT_PORT = 80
+CONF_PORT = "port"
+CONF_MAC = "mac"
+
+# ======================================================================
+# Hub behaviour — the numbers that decide how the installation survives.
+# Each one is here because getting it wrong caused a real outage; see the
+# reliability notes in the project brief before changing any of them.
+# ======================================================================
+IR_GAP_MS = 180
+"""Minimum spacing between two IR transmissions on one device."""
+
+SENSOR_INTERVAL = 60
+"""Sensor read interval, which is also the liveness heartbeat."""
+
+WATCHDOG_INTERVAL = 30
+"""How often every hub is checked for 'disconnected with nobody working on it'."""
+
+FAILURE_THRESHOLD = 3
+"""Consecutive failures before a session is dropped. A single timeout is not
+proof of a dead socket — dropping on the first one took whole floors down."""
+
+BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
+"""Soft backoff, capped. Not a single interval, not endless doubling."""
+
+GRACE_SECONDS = 120
+STARTUP_GRACE_SECONDS = 300
+"""Entities keep their state this long before going unavailable, so Wi-Fi
+micro-outages stay out of the history."""
+
+STARTUP_STAGGER = 0.2
+"""Delay between the first connect of consecutive hubs."""
+
+MAX_PARALLEL_IO = 16
+"""Blocking library calls in flight at once, across all hubs — Home Assistant's
+executor pool is shared with the rest of the system."""
+
+UPTIME_SAMPLES = 500
+"""Online/offline transitions kept in memory for the panel's uptime chart."""
+
+SIGNAL_HUB_UPDATE = "bms_smart_ir_hub_{}"
 
 CODES_DIR = "codes"
 SMARTIR_RAW_BASE = "https://raw.githubusercontent.com/smartHomeHub/SmartIR/master/codes"
