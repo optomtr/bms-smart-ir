@@ -1,22 +1,20 @@
-# Integratsiya logosini (ikonка) HA'да ko'rsatish
+# Логотип интеграции в интерфейсе Home Assistant
 
-Home Assistant integratsiya kartochка ikonкаsини **faqat** rasmiy
-`home-assistant/brands` bazasidan oladi (brands.home-assistant.io CDN orqali).
-Shuning uchun ikonка ko'rinishi uchun uni o'sha bazaga yuborish kerak —
-custom_components ичидаги icon.png faylининг o'zи kartochка logosини chiqармайди.
+Home Assistant берёт иконку на карточке интеграции **только** из официального
+репозитория `home-assistant/brands` (через CDN brands.home-assistant.io).
+Файл `icon.png` внутри `custom_components/` на карточку не попадает.
 
-Tayyor fayllar shu repoда: `brands/custom_integrations/bms_smart_ir/`
-  - icon.png     (256x256)
-  - icon@2x.png  (512x512)
+Готовые файлы лежат в `custom_components/bms_smart_ir/`:
+- `icon.png` — 256×256
+- `icon@2x.png` — 512×512
 
-## Qadamlar
+## Порядок действий
 
-1. https://github.com/home-assistant/brands ni **Fork** qiling.
-2. Fork'ингизга `custom_integrations/bms_smart_ir/` папка yarating va shu
-   repodagi `brands/custom_integrations/bms_smart_ir/` ичидаги 2 faylни
-   (icon.png, icon@2x.png) o'sha yerга qo'ying.
-3. Commit + push, keyin `home-assistant/brands` ga **Pull Request** oching.
-4. PR tasdiqлангач (odатда bir necha kun), HA'да "icon not available" o'rнига
-   logo chiqади. HA'ни keyinroq restart qiling / cache tozаланг.
+1. Форк `home-assistant/brands` уже есть: `optomtr/brands`.
+2. Создать в нём папку `custom_integrations/bms_smart_ir/` и положить туда обе
+   иконки из этого репозитория.
+3. Commit + push, затем открыть Pull Request в `home-assistant/brands`.
+4. После принятия PR (обычно несколько дней) вместо «icon not available»
+   появится логотип. Home Assistant после этого перезапустить / почистить кеш.
 
-Eslatма: bu faqat ko'rinиш uchun — integratsiya ikonкаsіз ham to'liق ishлайверади.
+Это только внешний вид — без иконки интеграция работает полностью.

@@ -1,54 +1,58 @@
-# BMS Smart IR (Broadlink + Tuya)
+# BMS Smart IR
 
-Home Assistant uchun **yagona** IR integratsiya. O'rnatib, qurilma qo'shganda
-avval **qaysi usul** ekanini so'raydi:
+ИК-интеграция для Home Assistant от **BMS Smart Home**: один компонент, два
+способа управления — выбор делается при добавлении устройства.
 
-- **Broadlink** — mahalliy universal pult (IP orqali), SmartIR kod bazasi bilan.
-- **Tuya** — Z100 kabi Tuya/Zigbee IR hub, **bulut** orqali (BMS akkauntini
-  qayta ishlatadi). Konditsioner → climate; TV/pristavka/ventilyator → remote + tugmalar.
+- **Broadlink** — локально, по IP-адресу ИК-пульта. Кондиционеры (`climate`) и
+  телевизоры (`media_player`), коды берутся из базы SmartIR.
+- **Tuya** — ИК-хаб (например Z100) через облако Tuya. Учётная запись берётся из
+  уже настроенной интеграции `bms_integration` — отдельный вход не нужен.
+  Кондиционер → `climate`; ТВ, приставка, вентилятор → `remote` + кнопки.
 
-Ya'ni ikkita alohida integratsiya (`bms_ir` va `bms_ir_tuya`) o'rniga — bittasi.
+Заменяет две прежние отдельные интеграции (`bms_ir` и `bms_ir_tuya`).
 
+## Установка
 
-> **Yangi (v1.1.0):** Broadlink orqali qo'shishda endi **Konditsioner** yoki **Televizor** tanlash mumkin. Televizor `media_player` qurilma sifatida (yoq/o'chir, ovoz, kanal, manba) qo'shiladi. TV kodlari [SmartIR media_player](https://github.com/smartHomeHub/SmartIR/blob/master/docs/MEDIA_PLAYER.md) bazasidan olinadi.
+**Через HACS:** HACS → Custom repositories → URL этого репозитория, тип
+**Integration** → ADD → Download → перезапуск Home Assistant.
+Установка идёт из GitHub Releases, поэтому нужен опубликованный релиз с тегом
+(`vX.Y.Z`), а репозиторий должен быть публичным.
 
-## O'rnatish (HACS)
+**Вручную:** скопировать папку `custom_components/bms_smart_ir` в
+`/config/custom_components/` и перезапустить Home Assistant.
 
-1. Bu repo fayllarini GitHub'ga yuklang (masalan `nurillaevich/bms-smart-ir`).
-2. GitHub'da **Release** yarating (tag `v1.0.0`).
-3. HACS → Custom repositories → repo URL, Type **Integration** → ADD → Download → Restart.
+## Добавление устройства
 
-> Yoki `custom_components/bms_smart_ir` papkasini qo'lda `/config/custom_components/` ga ko'chiring.
+Settings → Devices & Services → Add Integration → **BMS Smart IR**, дальше по меню.
 
-## Foydalanish
+**Broadlink:**
+1. Название + IP-адрес Broadlink (например `192.168.1.50`).
+2. Тип: кондиционер или телевизор.
+3. Производитель → модель/код: автоподбор по датчику мощности, последовательный
+   перебор или выбор вручную.
+4. Тест сигнала → если сработало, выбрать комнату и сохранить.
 
-**Settings → Devices & Services → Add Integration → "BMS Smart IR"**, so'ng menyudan tanlang:
+**Tuya:**
+1. ID ИК-хаба (например `bf9607ebbc40a65949aeuv`).
+2. Выбрать пульт из списка (рядом указана категория).
+3. Отправляется тестовый сигнал → завершить.
 
-**Broadlink** tanlasangiz:
-1. Nom + Broadlink IP manzili (masalan `192.168.1.50`).
-2. Ishlab chiqaruvchi → model/kod (avtomatik skan, ketma-ket yoki qo'lda).
-3. Test → ishlaganini qoldiring → xona tanlab saqlang.
+YAML не нужен, перезапуск на каждое устройство — тоже.
 
-**Tuya** tanlasangiz:
-1. IR hub ID'si (masalan `bf9607ebbc40a65949aeuv`).
-2. Ro'yxatdan pultni tanlang (yonida kategoriyasi yozilgan).
-3. Test signali yuboriladi → yakunlang.
+## Требования
 
-Har ikkisida ham YAML yo'q, har qurilmaga restart yo'q.
+- **Broadlink:** пульт в той же локальной сети, что и Home Assistant. Коды
+  скачиваются из репозитория SmartIR при первом использовании и кешируются
+  в `custom_components/bms_smart_ir/codes/`.
+- **Tuya:** настроенная интеграция `bms_integration` с облачным аккаунтом Tuya,
+  и включённый **IR API** в вашем проекте Tuya IoT.
 
-## Talablar
+## Миграция со старых версий
 
-- **Broadlink uchun**: Broadlink pult Wi-Fi'da, HA bilan bir tarmoqda. Kodlar
-  birinchi ishlatilganda SmartIR'dan yuklab olinadi (keyin keshlanadi).
-- **Tuya uchun**: `bms_integration` Tuya bulut akkauntи bilan sozlangan, va Tuya
-  loyihangizda **IR API yoqilgan**.
+Интеграция заменяет `BMSIR` и `BMSIRTUYA`. Чтобы устройства не задвоились,
+старые интеграции (или `bms_ir_ac.yaml`) нужно удалить.
 
-## Eski integratsiyalar
+## Лицензия и происхождение
 
-Bu integratsiya `BMSIR` va `BMSIRTUYA`'ning o'rnini bosadi. Qurilmalar **ikki
-marta** chiqmasligi uchun eski ikkalasini (yoki `bms_ir_ac.yaml` ni) olib tashlang.
-
-## Litsenziya
-
-MIT. SmartIR kod bazasi ma'lumotlari [SmartIR](https://github.com/smartHomeHub/SmartIR)
-(MIT, © 2019 Vassilis Panos) formatiga mos.
+MIT, © 2026 BMS Smart Home. Формат и данные базы ИК-кодов совместимы с
+[SmartIR](https://github.com/smartHomeHub/SmartIR) (MIT, © 2019 Vassilis Panos).
