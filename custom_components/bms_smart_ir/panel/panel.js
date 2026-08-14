@@ -448,6 +448,10 @@ class BmsIrPanel extends HTMLElement {
   }
 
   _note(message, kind = "") {
+    // Когда сам Home Assistant переподключается, он показывает свою плашку —
+    // дублировать её своей ошибкой незачем.
+    const connection = this._hass && this._hass.connection;
+    if (kind === "bad" && connection && connection.connected === false) return;
     this._toast = { message, kind };
     this._render();
     clearTimeout(this._toastTimer);
@@ -586,7 +590,7 @@ class BmsIrPanel extends HTMLElement {
         ? h("div", { class: "map" }, hubs.map((hub) => h("div", { class: "hub-row" }, [
             h("div", { class: "hub-side" }, [
               h("div", { class: "row" }, [icon("wifi", 16), h("b", { text: hub.name || `Broadlink ${hub.host}` })]),
-              h("div", { class: "addr", text: hub.host }),
+              h("div", { class: "addr", text: hub.hub_id }),
               h("div", { style: "margin-top:6px" }, [statusPill(hub.status)]),
             ]),
             h("div", { class: "kids" }, (hub.appliances || []).length
