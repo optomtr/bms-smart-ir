@@ -40,7 +40,7 @@ sim() {
   # (её командная строка содержит имя файла) и убивает сам себя.
   docker exec "$CONTAINER" sh -c "pkill -f '[b]roadlink_sim.py'" || true
   docker exec -d "$CONTAINER" python3 /config/broadlink_sim.py \
-    --count "$COUNT" --base-port "$BASE_PORT" --json /config/sim_devices.json
+    --count "$COUNT" --base-port "$BASE_PORT" --drift --json /config/sim_devices.json
   sleep 4
   local alive
   alive="$(docker exec "$CONTAINER" sh -c "ps aux | grep -c '[b]roadlink_sim'")"

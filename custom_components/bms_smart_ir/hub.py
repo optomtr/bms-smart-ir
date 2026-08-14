@@ -329,8 +329,6 @@ class BroadlinkHub:
 
         self._last_tx = time.monotonic()
         self.stats.sent += 1
-        self.stats.last_ok = time.time()
-        self._mark_online()
         return True
 
     # ---- sensors / heartbeat --------------------------------------------
@@ -394,7 +392,7 @@ class BroadlinkHub:
                 if device is None:
                     device = await self._async_connect()
                 try:
-                    return await self.hass.async_add_executor_job(action, device)
+                    result = await self.hass.async_add_executor_job(action, device)
                 except (blx.NetworkTimeoutError, blx.DataValidationError):
                     raise
                 except (blx.AuthorizationError, blx.ConnectionClosedError):
@@ -404,6 +402,11 @@ class BroadlinkHub:
                     # A transport error IS proof the socket is gone.
                     self._device = None
                     raise
+                # Any answer at all is proof of life, not just a transmission:
+                # the panel shows this as "последний обмен".
+                self.stats.last_ok = time.time()
+                self._mark_online()
+                return result
 
     async def _async_connect(self) -> Any:
         loop_device = await self.hass.async_add_executor_job(self._connect_sync)

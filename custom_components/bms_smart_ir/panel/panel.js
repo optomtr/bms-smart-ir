@@ -285,9 +285,16 @@ function lineChart(points, { unit = "", color = "var(--ir-accent)", fill = true 
   }
 
   const values = usable.map((point) => point.value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || 1;
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (max - min < 0.5) {
+    // Ровная линия — обычное дело для комнаты: раздвигаем шкалу, иначе
+    // график лежит на нижней границе и выглядит как «данных нет».
+    const middle = (max + min) / 2;
+    min = middle - 1;
+    max = middle + 1;
+  }
+  const span = max - min;
   const times = usable.map((point) => point.at);
   const first = times[0];
   const last = times[times.length - 1] || first + 1;
@@ -306,6 +313,21 @@ function lineChart(points, { unit = "", color = "var(--ir-accent)", fill = true 
     label.setAttribute("x", 4); label.setAttribute("y", y + 3.5);
     label.setAttribute("fill", "var(--ir-mut)"); label.setAttribute("font-size", "10");
     label.textContent = `${level.toFixed(1)}${unit}`;
+    svg.appendChild(label);
+  }
+
+  // Подписи времени: без них непонятно, показан ли час или сутки — особенно
+  // когда записей всего за несколько минут, а окно запрошено суточное.
+  for (const [at, anchor] of [[first, "start"], [(first + last) / 2, "middle"], [last, "end"]]) {
+    const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    label.setAttribute("x", scaleX(at).toFixed(1));
+    label.setAttribute("y", height - 4);
+    label.setAttribute("text-anchor", anchor);
+    label.setAttribute("fill", "var(--ir-mut)");
+    label.setAttribute("font-size", "10");
+    label.textContent = new Date(at * 1000).toLocaleTimeString("ru-RU", {
+      hour: "2-digit", minute: "2-digit",
+    });
     svg.appendChild(label);
   }
 

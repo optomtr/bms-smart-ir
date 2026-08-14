@@ -132,6 +132,7 @@ class VirtualRM4(asyncio.DatagramProtocol):
         humidity: float = 45.0,
         faults: Faults | None = None,
         rng: random.Random | None = None,
+        drift: bool = False,
     ) -> None:
         devtype, model_name, has_sensor = MODELS[model]
         self.mac = mac
@@ -144,6 +145,8 @@ class VirtualRM4(asyncio.DatagramProtocol):
         self.humidity = humidity
         self.faults = faults or Faults()
         self._rng = rng or random.Random(0)
+        self.drift = drift
+        self._drift_phase = (rng or random.Random(0)).random() * 6.28
 
         self.ir_log: list[IrEvent] = []
         self.stats = Stats()
@@ -296,8 +299,13 @@ class VirtualRM4(asyncio.DatagramProtocol):
         if self.faults.sensor_silent:
             return None
         self.stats.sensor_reads += 1
-        temperature = 0.0 if self.faults.zero_sensor else self.temperature
-        humidity = 0.0 if self.faults.zero_sensor else self.humidity
+        # An RM4 mini has no accessory and answers zeroes — the bench has to
+        # do the same, otherwise a third of the fleet lies about having a
+        # thermometer and the "only where the hardware has one" path is never
+        # exercised.
+        blind = self.faults.zero_sensor or not self.has_sensor
+        temperature = 0.0 if blind else self._reading(self.temperature)
+        humidity = 0.0 if blind else self._reading(self.humidity, span=2.0)
         # broadlink.remote.rm4mini.check_sensors reads whole + hundredths and
         # adds them, so the split has to floor: -3.5 is (-4, 50), not (-3, 50).
         return struct.pack("<bbBB", *_split_decimal(temperature), *_split_decimal(humidity))
@@ -324,6 +332,16 @@ class VirtualRM4(asyncio.DatagramProtocol):
     def feed_learned_code(self, data: bytes) -> None:
         """Pretend a remote was pointed at the device (for future learning)."""
         self._pending_learned = data
+
+    def _reading(self, base: float, span: float = 0.6) -> float:
+        """A slowly wandering value, so charts on the bench are not flat.
+
+        Off by default: tests assert exact readings.
+        """
+        if not self.drift:
+            return base
+        phase = (time.monotonic() / 180.0) + self._drift_phase
+        return round(base + math.sin(phase) * span, 2)
 
     def reboot(self) -> None:
         """Forget the session the way a power-cycled device does.
@@ -398,6 +416,7 @@ class Farm:
         models: list[str] | None = None,
         seed: int = 1,
         name_prefix: str = "BMS Sim",
+        drift: bool = False,
     ) -> None:
         self.host = host
         self.base_port = base_port
@@ -411,6 +430,7 @@ class Farm:
                 temperature=round(rng.uniform(18.0, 28.0), 2),
                 humidity=round(rng.uniform(30.0, 60.0), 2),
                 rng=random.Random(seed + index),
+                drift=drift,
             )
             for index in range(count)
         ]
@@ -514,6 +534,11 @@ def main() -> None:
     )
     parser.add_argument("--json", help="write the device list to this file")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--drift",
+        action="store_true",
+        help="медленно менять показания датчиков — чтобы графики были живыми",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -523,6 +548,7 @@ def main() -> None:
         base_port=args.base_port,
         models=[m.strip() for m in args.models.split(",") if m.strip()],
         seed=args.seed,
+        drift=args.drift,
     )
     farm.start()
     listing = farm.describe()
