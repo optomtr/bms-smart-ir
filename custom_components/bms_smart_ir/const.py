@@ -56,6 +56,10 @@ IR_GAP_MS = 180
 SENSOR_INTERVAL = 60
 """Sensor read interval, which is also the liveness heartbeat."""
 
+FIRST_HEARTBEAT_DELAY = 5
+"""Wait before the first heartbeat. Right after a restart Home Assistant is
+busy setting everything else up; the connection is made on demand anyway."""
+
 WATCHDOG_INTERVAL = 30
 """How often every hub is checked for 'disconnected with nobody working on it'."""
 

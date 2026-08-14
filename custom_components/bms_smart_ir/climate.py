@@ -1,4 +1,4 @@
-"""Unified climate platform: Broadlink (SmartIR) or Tuya cloud AC."""
+"""Climate platform: a Broadlink air conditioner or a Tuya cloud one."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .bl_climate import async_build_climate as build_broadlink_climate
+from .bl_climate import async_build_climate
 from .const import (
     BACKEND_BROADLINK,
     CONF_BACKEND,
@@ -17,6 +17,7 @@ from .const import (
     CONF_INFRARED_ID,
     CONF_NAME,
     DEVICE_TYPE_MEDIA_PLAYER,
+    DOMAIN,
     KIND_CLIMATE,
 )
 from .tuya_climate import TuyaClimate
@@ -31,12 +32,13 @@ async def async_setup_entry(
     if entry.data.get(CONF_BACKEND) == BACKEND_BROADLINK:
         if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_MEDIA_PLAYER:
             return
-        entity = await build_broadlink_climate(hass, entry)
-        if entity is not None:
-            async_add_entities([entity])
+        runtime = hass.data[DOMAIN]["entries"][entry.entry_id]
+        entity = await async_build_climate(
+            hass, entry, runtime["hub"], runtime["config"]
+        )
+        async_add_entities([entity])
         return
 
-    # Tuya backend
     data = entry.runtime_data
     if not isinstance(data, dict) or data.get("kind") != KIND_CLIMATE:
         return

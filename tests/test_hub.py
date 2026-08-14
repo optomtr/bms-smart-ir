@@ -217,7 +217,9 @@ async def test_hub_identity_follows_the_hardware(hass, farm: Farm):
     try:
         await hub.async_send(IR)
         assert hub.mac == farm.devices[0].mac
-        assert hub.hub_id == farm.devices[0].mac.hex()
+        # On the bench every emitter has its own port, so the key carries it;
+        # a real Broadlink answers on 80 and keeps the bare address.
+        assert hub.hub_id == f"{hub.host}:{hub.port}"
         assert hub.model == "RM4 pro"
 
         described = hub.describe()
@@ -225,6 +227,13 @@ async def test_hub_identity_follows_the_hardware(hass, farm: Farm):
         assert "key" not in str(described).lower()
     finally:
         await hub.async_stop()
+
+
+def test_a_normal_emitter_is_keyed_by_its_address_alone():
+    from custom_components.bms_smart_ir.hub import hub_key
+
+    assert hub_key("192.168.1.50", 80) == "192.168.1.50"
+    assert hub_key("192.168.1.50", 20000) == "192.168.1.50:20000"
 
 
 def test_the_emitter_pause_stays_sane():

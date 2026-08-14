@@ -39,6 +39,7 @@ from .const import (
     DEFAULT_TIMEOUT,
     DOMAIN,
     FAILURE_THRESHOLD,
+    FIRST_HEARTBEAT_DELAY,
     GRACE_SECONDS,
     IR_GAP_MS,
     MAX_PARALLEL_IO,
@@ -139,13 +140,13 @@ class BroadlinkHub:
     def hub_id(self) -> str:
         """Stable id for the device registry and the panel.
 
-        Keyed by MAC once known so that swapping the box for a new one at the
-        same address is a different hub, and moving a box to a new address is
-        the same hub.
+        The address, not the MAC: it is known before the first connection, so
+        the device card and its history exist from the start even for a box
+        that is offline right now. Replacing the hardware at the same address
+        keeps the card; moving a box to a new address is handled explicitly by
+        the panel, which renames the device instead of orphaning it.
         """
-        if self.mac:
-            return self.mac.hex()
-        return self.host
+        return hub_key(self.host, self.port)
 
     @property
     def mac_text(self) -> str | None:
@@ -340,7 +341,7 @@ class BroadlinkHub:
         box with no sensor still has to be watched — there it asks the device
         for its name instead, which emits no IR.
         """
-        await asyncio.sleep(self.start_delay + 1)
+        await asyncio.sleep(self.start_delay + FIRST_HEARTBEAT_DELAY)
         while True:
             try:
                 await self.async_heartbeat()
@@ -348,7 +349,7 @@ class BroadlinkHub:
                 raise
             except Exception as err:  # noqa: BLE001 - the loop must not die
                 self._record_error(err)
-            self._notify()
+                self._notify()
             await asyncio.sleep(self.sensor_interval)
 
     async def async_heartbeat(self) -> None:
@@ -357,18 +358,21 @@ class BroadlinkHub:
             # No accessory to read, but the device still has to be watched.
             # `update()` asks for the name — no IR leaves the emitter.
             await self._run_io(lambda device: device.update(), "ping")
+            self._notify()
             return
 
         readings = await self.async_read_sensors(force=self.has_sensor is None)
         if not readings:
             if self.has_sensor is None:
                 self.has_sensor = False
+            self._notify()
             return
         if self.has_sensor is None:
             # A box without the accessory answers 0/0 forever.
             self.has_sensor = any(value != 0 for value in readings.values())
         if self.has_sensor:
             self.sensors = readings
+        self._notify()
 
     def _read_sensors_sync(self, device: Any) -> dict[str, float]:
         if not hasattr(device, "check_sensors"):
@@ -422,9 +426,14 @@ class BroadlinkHub:
         self._failures = 0
         self._backoff_index = 0
         if self._status != STATUS_ONLINE:
+            was = self._status
             self._status = STATUS_ONLINE
             self._since = time.monotonic()
             self.uptime_log.append((time.time(), True))
+            if was != STATUS_CONNECTING:
+                _LOGGER.info("%s: связь восстановлена (%s)", self.hub_id, self.model or "?")
+            else:
+                _LOGGER.info("%s: подключён (%s)", self.hub_id, self.model or "?")
             self._notify()
 
     def _record_error(self, err: Exception) -> None:
@@ -434,6 +443,7 @@ class BroadlinkHub:
         self._failures += 1
 
         transport_dead = self._device is None
+        _LOGGER.debug("%s: ошибка обмена (%s)", self.hub_id, self.stats.last_error)
         if transport_dead or self._failures >= FAILURE_THRESHOLD:
             # Only now do we admit the device is gone: a single timeout is
             # normal on Wi-Fi and must not take the session with it.
@@ -442,8 +452,18 @@ class BroadlinkHub:
                 self._status = STATUS_RECONNECTING
                 self._since = time.monotonic()
                 self.uptime_log.append((time.time(), False))
+                # One line per transition, not per failure: a device that is
+                # down for a week must not fill the disk.
+                _LOGGER.warning(
+                    "%s: связь потеряна (%s), переподключаюсь",
+                    self.hub_id,
+                    self.stats.last_error,
+                )
             elif self._status == STATUS_CONNECTING and not self.available:
                 self._status = STATUS_UNAVAILABLE
+                _LOGGER.warning(
+                    "%s: не отвечает при запуске (%s)", self.hub_id, self.stats.last_error
+                )
             self._notify()
 
     @property
@@ -490,6 +510,16 @@ def _io_limit(hass: HomeAssistant) -> asyncio.Semaphore:
     return limit
 
 
+def hub_key(host: str, port: int = DEFAULT_PORT) -> str:
+    """Identity of one emitter.
+
+    The port is part of it: every real Broadlink answers on 80, but a test
+    bench runs many of them on one address, and a hub keyed by address alone
+    silently merged all of them into one.
+    """
+    return host if port == DEFAULT_PORT else f"{host}:{port}"
+
+
 def async_hubs(hass: HomeAssistant) -> dict[str, BroadlinkHub]:
     return _domain_data(hass).setdefault(DATA_HUBS, {})
 
@@ -499,7 +529,8 @@ async def async_get_hub(
 ) -> BroadlinkHub:
     """Return the hub for an address, creating and starting it once."""
     hubs = async_hubs(hass)
-    hub = hubs.get(host)
+    key = hub_key(host, port)
+    hub = hubs.get(key)
     if hub is None:
         hub = BroadlinkHub(
             hass,
@@ -508,21 +539,24 @@ async def async_get_hub(
             timeout=timeout,
             start_delay=len(hubs) * STARTUP_STAGGER,
         )
-        hubs[host] = hub
+        hubs[key] = hub
         await hub.async_start()
         await async_start_watchdog(hass)
     hub.acquire()
     return hub
 
 
-async def async_release_hub(hass: HomeAssistant, host: str) -> None:
+async def async_release_hub(
+    hass: HomeAssistant, host: str, port: int = DEFAULT_PORT
+) -> None:
     hubs = async_hubs(hass)
-    hub = hubs.get(host)
+    key = hub_key(host, port)
+    hub = hubs.get(key)
     if hub is None:
         return
     if hub.release():
         await hub.async_stop()
-        hubs.pop(host, None)
+        hubs.pop(key, None)
 
 
 async def async_start_watchdog(hass: HomeAssistant) -> None:
@@ -534,7 +568,15 @@ async def async_start_watchdog(hass: HomeAssistant) -> None:
     async def _watch() -> None:
         while True:
             await asyncio.sleep(WATCHDOG_INTERVAL)
-            for hub in list(async_hubs(hass).values()):
+            hubs = list(async_hubs(hass).values())
+            waiting = [hub for hub in hubs if hub.status != STATUS_ONLINE]
+            if waiting:
+                _LOGGER.debug(
+                    "Сторож: %d из %d устройств без связи, поднимаю подключение",
+                    len(waiting),
+                    len(hubs),
+                )
+            for hub in hubs:
                 await hub.async_ensure_connection()
 
     data[DATA_WATCHDOG] = hass.async_create_background_task(

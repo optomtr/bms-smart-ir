@@ -1,0 +1,148 @@
+<!doctype html>
+<!--
+  Витрина панели без Home Assistant.
+
+  Загружает боевой panel.js и подставляет вместо hass заглушку, которая
+  отвечает на те же команды bms_smart_ir/*. Нужна для работы над версткой и
+  для быстрой проверки вида в светлой и тёмной теме — логика при этом не
+  подменяется: рисует ровно тот код, который уезжает в Home Assistant.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>BMS ИК-пульты — витрина панели</title>
+<style>
+  body { margin: 0; font-family: Inter, system-ui, sans-serif; }
+  .bar { display: flex; gap: 10px; align-items: center; padding: 8px 14px; background: #101820; color: #fff; font-size: 13px; }
+  .bar button { background: #21303d; color: #fff; border: 0; border-radius: 7px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  .bar button.on { background: #0b76ef; }
+  .dark { --primary-background-color: #10161d; --card-background-color: #18202a; --divider-color: #27313d;
+          --primary-text-color: #e9eef4; --secondary-text-color: #9aa7b4; --primary-color: #3d8bff; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <b>Витрина панели</b>
+  <button id="light" class="on">Светлая тема</button>
+  <button id="dark">Тёмная тема</button>
+  <span id="hint" style="opacity:.7"></span>
+</div>
+<div id="host"></div>
+
+<script type="module">
+import "../custom_components/bms_smart_ir/panel/panel.js";
+
+const NAMES = ["Гостиная", "Спальня", "Кухня", "Кабинет", "Детская", "Холл", "Прихожая", "Столовая"];
+const MODELS = ["RM4 pro", "RM4C mini", "RM4 mini"];
+
+function makeHubs(count) {
+  const hubs = [];
+  for (let i = 0; i < count; i++) {
+    const model = MODELS[i % 3];
+    const status = i === 3 ? "reconnecting" : i === 7 ? "unavailable" : "online";
+    const appliances = [];
+    appliances.push({
+      entry_id: `e${i}a`, name: `Кондиционер ${NAMES[i % NAMES.length]}`,
+      device_type: "climate", device_type_label: "Кондиционер",
+      manufacturer: "Gree", model: "GWH18ACD", code: "1187",
+      entity_id: `climate.konditsioner_${i}`, state: i % 4 ? "cool" : "off", attributes: {},
+    });
+    if (i % 3 === 0) appliances.push({
+      entry_id: `e${i}b`, name: `Телевизор ${NAMES[i % NAMES.length]}`,
+      device_type: "media_player", device_type_label: "Телевизор",
+      manufacturer: "LG", model: "43UM7510", code: "1042",
+      entity_id: `media_player.tv_${i}`, state: "off", attributes: {},
+    });
+    hubs.push({
+      hub_id: `192.168.1.${50 + i}`, host: `192.168.1.${50 + i}`, port: 80,
+      mac: `24:DF:A7:00:${String(i).padStart(2, "0")}:01`, model,
+      name: `Broadlink ${NAMES[i % NAMES.length]}`, status,
+      available: status !== "unavailable", since: Date.now() / 1000 - 3600,
+      has_sensor: model !== "RM4 mini",
+      sensors: model !== "RM4 mini" ? { temperature: 21 + (i % 6) * 0.7, humidity: 38 + (i % 9) } : {},
+      queue: 0,
+      stats: { sent: 120 + i * 7, failed: i === 3 ? 4 : 0, coalesced: 18 + i, reconnects: i === 3 ? 2 : 0,
+               last_ok: Date.now() / 1000 - 12, last_error: i === 3 ? "NetworkTimeoutError: нет ответа" : null,
+               last_error_at: i === 3 ? Date.now() / 1000 - 90 : null },
+      appliances,
+      entities: { temperature: `sensor.broadlink_${i}_t`, humidity: `sensor.broadlink_${i}_h`, online: `binary_sensor.broadlink_${i}` },
+    });
+  }
+  return hubs;
+}
+
+const HUBS = makeHubs(12);
+const CATALOG = [
+  { manufacturer: "Gree", popular: true, models: [{ code: "1187", model: "GWH09" }, { code: "1186", model: "GWH18ACD-D3DNA" }] },
+  { manufacturer: "Midea", popular: true, models: [{ code: "1388", model: "42MAQA09S5" }] },
+  { manufacturer: "LG", popular: true, models: [{ code: "1064", model: "P12RK" }, { code: "1069", model: "AKB74295304" }] },
+  { manufacturer: "Zanussi", popular: true, models: [{ code: "1300", model: "ZACS-07" }] },
+  { manufacturer: "Actron", popular: false, models: [{ code: "1400", model: "Generic" }] },
+  { manufacturer: "Bosch", popular: false, models: [{ code: "1410", model: "Generic" }] },
+];
+
+function history(hours, base, spread) {
+  const now = Date.now() / 1000;
+  const points = [];
+  for (let i = hours * 6; i >= 0; i--) {
+    points.push({ at: now - i * 600, state: (base + Math.sin(i / 7) * spread).toFixed(1) });
+  }
+  return points;
+}
+
+const hass = {
+  states: {},
+  callWS: async (msg) => {
+    const kind = msg.type.replace("bms_smart_ir/", "");
+    if (kind === "overview") {
+      return { hubs: HUBS, totals: { hubs: HUBS.length, online: HUBS.filter((x) => x.status === "online").length,
+        appliances: HUBS.reduce((sum, x) => sum + x.appliances.length, 0), with_sensor: HUBS.filter((x) => x.has_sensor).length } };
+    }
+    if (kind === "hub") {
+      const hub = HUBS.find((x) => x.hub_id === msg.host) || HUBS[0];
+      return { ...hub, uptime_log: [
+        { at: Date.now() / 1000 - 7200, online: true },
+        { at: Date.now() / 1000 - 3000, online: false },
+        { at: Date.now() / 1000 - 2800, online: true },
+      ] };
+    }
+    if (kind === "areas") return { areas: NAMES.map((name, i) => ({ area_id: `a${i}`, name })) };
+    if (kind === "catalog") return { catalog: CATALOG };
+    if (kind === "history") {
+      const out = {};
+      for (const id of msg.entity_ids) {
+        if (id.endsWith("_h")) out[id] = history(24, 45, 6);
+        else if (id.startsWith("binary_sensor")) out[id] = [{ at: Date.now() / 1000 - 86400, state: "on" }, { at: Date.now() / 1000 - 5000, state: "off" }, { at: Date.now() / 1000 - 4600, state: "on" }];
+        else out[id] = history(24, 22, 2.5);
+      }
+      return { history: out };
+    }
+    if (kind === "discover" || kind === "probe") {
+      return { devices: [
+        { host: "192.168.1.61", port: 80, mac: "24:DF:A7:11:22:33", model: "RM4 pro", name: "RM4 Pro", known: false, appliances: 0 },
+        { host: "192.168.1.50", port: 80, mac: "24:DF:A7:00:00:01", model: "RM4C mini", name: "Broadlink Гостиная", known: true, appliances: 2 },
+      ] };
+    }
+    if (kind === "test_code") return { delivered: true, code: {} };
+    if (kind === "add_appliance") return { entry_id: "new" };
+    return { ok: true };
+  },
+};
+
+const panel = document.createElement("bms-ir-panel");
+panel.hass = hass;
+document.getElementById("host").appendChild(panel);
+
+document.getElementById("light").onclick = () => {
+  document.body.classList.remove("dark");
+  document.getElementById("light").classList.add("on");
+  document.getElementById("dark").classList.remove("on");
+};
+document.getElementById("dark").onclick = () => {
+  document.body.classList.add("dark");
+  document.getElementById("dark").classList.add("on");
+  document.getElementById("light").classList.remove("on");
+};
+</script>
+</body>
+</html>

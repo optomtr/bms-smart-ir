@@ -25,6 +25,7 @@ from homeassistant.config_entries import (
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import slugify
 
 from .cloud import TuyaIRCloud
 from .const import (
@@ -51,11 +52,13 @@ from .const import (
     CONF_NAME,
     CONF_POWER_SCAN_SENSOR,
     CONF_POWER_SENSOR,
+    CONF_PORT,
     CONF_SCAN_THRESHOLD,
     CONF_TEMPERATURE_SENSOR,
     CONF_TIMEOUT,
     CONTROLLER_BROADLINK,
     DEFAULT_MODE_INT,
+    DEFAULT_PORT,
     DEFAULT_SCAN_SETTLE,
     DEFAULT_SCAN_THRESHOLD,
     DEFAULT_SCAN_WAIT,
@@ -68,15 +71,35 @@ from .const import (
     KIND_CLIMATE,
     KIND_REMOTE,
 )
-from .controller import BroadlinkIRController
-from .device_data import (
-    async_ensure_code_file,
-    build_catalog,
-    representative_command,
-)
+from .codes import async_catalog, async_load_code, representative_command
+from .discovery import async_probe, async_send_test, split_host
+from .entity import _decode
 from .helpers import find_bms_creds
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _catalog_map(hass, device_type: str, controller: str) -> dict[str, list[dict]]:
+    """The catalogue keyed by manufacturer, which is what the dropdowns want."""
+    catalog = await async_catalog(hass, device_type, controller)
+    return {entry["manufacturer"]: entry["models"] for entry in catalog}
+
+
+def appliance_unique_id(data: dict[str, Any]) -> str:
+    """Identity of one appliance.
+
+    The name is part of it: two identical air conditioners of the same model on
+    one emitter is an ordinary installation, and the previous scheme (type +
+    address + code) refused the second one.
+    """
+    return "_".join(
+        [
+            data[CONF_DEVICE_TYPE],
+            data[CONF_HOST],
+            str(data[CONF_DEVICE_CODE]),
+            slugify(data[CONF_NAME]),
+        ]
+    )
 
 RESULT_WORKED = "worked"
 RESULT_RESEND = "resend"
@@ -145,7 +168,7 @@ def _remote_label(remote: dict) -> str:
 class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
     """Unified configuration flow."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         # Broadlink branch state
@@ -179,6 +202,39 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user", menu_options=[BACKEND_BROADLINK, BACKEND_TUYA]
         )
 
+    async def async_step_import(
+        self, import_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Add an appliance chosen in the panel.
+
+        The panel has already picked the emitter, the code and the name and has
+        fired a test signal; this validates and stores the result. Going
+        through a flow rather than writing an entry directly keeps one place
+        where entries are created.
+        """
+        data: dict[str, Any] = {
+            CONF_BACKEND: BACKEND_BROADLINK,
+            CONF_CONTROLLER: CONTROLLER_BROADLINK,
+            CONF_NAME: import_data[CONF_NAME].strip(),
+            CONF_HOST: import_data[CONF_HOST],
+            CONF_PORT: import_data.get(CONF_PORT, DEFAULT_PORT),
+            CONF_TIMEOUT: DEFAULT_TIMEOUT,
+            CONF_DEVICE_TYPE: import_data[CONF_DEVICE_TYPE],
+            CONF_DEVICE_CODE: str(import_data[CONF_DEVICE_CODE]),
+        }
+        for optional in (CONF_MANUFACTURER, CONF_MODEL, CONF_AREA):
+            if import_data.get(optional):
+                data[optional] = import_data[optional]
+
+        if not await async_load_code(
+            self.hass, data[CONF_DEVICE_TYPE], data[CONF_DEVICE_CODE]
+        ):
+            return self.async_abort(reason="no_codes")
+
+        await self.async_set_unique_id(appliance_unique_id(data))
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(title=data[CONF_NAME], data=data)
+
     # ====================================================================
     # BROADLINK BRANCH
     # ====================================================================
@@ -189,18 +245,31 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
     def _candidates(self) -> list[dict]:
         return self._catalog.get(self._manufacturer, [])
 
+    async def _send(self, command: str, data: dict) -> bool:
+        """Fire one command at the emitter being configured."""
+        frame = _decode(command, data.get("commandsEncoding", "Base64"))
+        if frame is None:
+            return False
+        return await async_send_test(
+            self.hass,
+            self._data[CONF_HOST],
+            frame,
+            port=self._data.get(CONF_PORT, DEFAULT_PORT),
+            timeout=self._data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
+        )
+
     async def async_step_broadlink(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            host = user_input[CONF_HOST].strip()
+            host, port = split_host(user_input[CONF_HOST])
             timeout = int(user_input.get(CONF_TIMEOUT, DEFAULT_TIMEOUT))
-            controller = BroadlinkIRController(self.hass, host, timeout=timeout)
-            if await controller.async_test_connection():
+            if await async_probe(self.hass, host, port=port, timeout=timeout):
                 self._data[CONF_BACKEND] = BACKEND_BROADLINK
                 self._data[CONF_NAME] = user_input[CONF_NAME]
                 self._data[CONF_HOST] = host
+                self._data[CONF_PORT] = port
                 self._data[CONF_TIMEOUT] = timeout
                 self._data[CONF_CONTROLLER] = CONTROLLER_BROADLINK
                 return await self.async_step_bl_type()
@@ -237,10 +306,10 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
 
         options = [
             selector.SelectOptionDict(
-                value=DEVICE_TYPE_CLIMATE, label="❄️ Konditsioner"
+                value=DEVICE_TYPE_CLIMATE, label="❄️ Кондиционер"
             ),
             selector.SelectOptionDict(
-                value=DEVICE_TYPE_MEDIA_PLAYER, label="📺 Televizor"
+                value=DEVICE_TYPE_MEDIA_PLAYER, label="📺 Телевизор"
             ),
         ]
         schema = vol.Schema(
@@ -260,11 +329,8 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if not self._catalog:
-            self._catalog = await self.hass.async_add_executor_job(
-                build_catalog,
-                self._dir,
-                self._data[CONF_DEVICE_TYPE],
-                self._data[CONF_CONTROLLER],
+            self._catalog = await _catalog_map(
+                self.hass, self._data[CONF_DEVICE_TYPE], self._data[CONF_CONTROLLER]
             )
         if not self._catalog:
             return self.async_abort(reason="no_codes")
@@ -436,32 +502,21 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> bool:
         for entry in candidates:
             code = entry["code"]
-            data = await async_ensure_code_file(
-                self.hass, self._dir, DEVICE_TYPE_CLIMATE, code
-            )
+            data = await async_load_code(self.hass, DEVICE_TYPE_CLIMATE, code)
             if not data:
                 continue
             on_command = representative_command(data)
             if not on_command:
                 continue
-            controller = BroadlinkIRController(
-                self.hass,
-                self._data[CONF_HOST],
-                data.get("commandsEncoding", "Base64"),
-                self._data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
-            )
             off_command = data.get("commands", {}).get("off")
-            try:
-                if off_command:
-                    await controller.send(off_command)
-                await asyncio.sleep(DEFAULT_SCAN_SETTLE)
-                baseline = self._read_power(sensor) or 0.0
-                await controller.send(on_command)
-                await asyncio.sleep(DEFAULT_SCAN_WAIT)
-                after = self._read_power(sensor)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("BMS Smart IR scan: send failed for %s: %s", code, err)
+            if off_command and not await self._send(off_command, data):
                 continue
+            await asyncio.sleep(DEFAULT_SCAN_SETTLE)
+            baseline = self._read_power(sensor) or 0.0
+            if not await self._send(on_command, data):
+                continue
+            await asyncio.sleep(DEFAULT_SCAN_WAIT)
+            after = self._read_power(sensor)
 
             if after is not None and (after - baseline) >= threshold:
                 _LOGGER.info(
@@ -483,9 +538,8 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
             (e["model"] for e in self._candidates() if e["code"] == code),
             self._manufacturer,
         )
-        self._current_data = await async_ensure_code_file(
+        self._current_data = await async_load_code(
             self.hass,
-            self._dir,
             self._data.get(CONF_DEVICE_TYPE, DEVICE_TYPE_CLIMATE),
             code,
         )
@@ -549,24 +603,16 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _send_test(self) -> None:
         if not self._current_data:
-            self._test_status = "⚠️ Kod fayli o'qilmadi."
+            self._test_status = "⚠️ Не удалось прочитать файл кода."
             return
         command = representative_command(self._current_data)
         if not command:
-            self._test_status = "⚠️ Bu kodda yuboriladigan komanda topilmadi."
+            self._test_status = "⚠️ В этом коде нет команды для отправки."
             return
-        controller = BroadlinkIRController(
-            self.hass,
-            self._data[CONF_HOST],
-            self._current_data.get("commandsEncoding", "Base64"),
-            self._data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
-        )
-        try:
-            await controller.send(command)
-            self._test_status = "📡 Test signali yuborildi."
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("BMS Smart IR test send failed: %s", err)
-            self._test_status = f"⚠️ Yuborishda xato: {err}"
+        if await self._send(command, self._current_data):
+            self._test_status = "📡 Тестовый сигнал отправлен."
+        else:
+            self._test_status = "⚠️ Не удалось отправить — проверьте связь с Broadlink."
 
     async def async_step_finish(
         self, user_input: dict[str, Any] | None = None
@@ -584,12 +630,7 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
                 if user_input.get(key):
                     self._data[key] = user_input[key]
 
-            unique_id = (
-                f"{self._data[CONF_DEVICE_TYPE]}_"
-                f"{self._data[CONF_HOST]}_"
-                f"{self._working_code}"
-            )
-            await self.async_set_unique_id(unique_id)
+            await self.async_set_unique_id(appliance_unique_id(self._data))
             self._abort_if_unique_id_configured()
             return self.async_create_entry(title=self._data[CONF_NAME], data=self._data)
 
@@ -612,8 +653,8 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if not self._catalog:
-            self._catalog = await self.hass.async_add_executor_job(
-                build_catalog, self._dir, DEVICE_TYPE_MEDIA_PLAYER, CONTROLLER_BROADLINK
+            self._catalog = await _catalog_map(
+                self.hass, DEVICE_TYPE_MEDIA_PLAYER, CONTROLLER_BROADLINK
             )
         if not self._catalog:
             return self.async_abort(reason="no_codes")
@@ -727,7 +768,7 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _send_tv_test(self) -> None:
         data = self._current_data
         if not data:
-            self._test_status = "⚠️ Kod fayli o'qilmadi."
+            self._test_status = "⚠️ Не удалось прочитать файл кода."
             return
         commands = data.get("commands", {})
         command = (
@@ -742,23 +783,15 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
                     command = value
                     break
         if not command:
-            self._test_status = "⚠️ Bu kodda yuboriladigan komanda topilmadi."
+            self._test_status = "⚠️ В этом коде нет команды для отправки."
             return
-        controller = BroadlinkIRController(
-            self.hass,
-            self._data[CONF_HOST],
-            data.get("commandsEncoding", "Base64"),
-            self._data.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
-        )
-        try:
-            await controller.send(command)
+        if await self._send(command, data):
             self._test_status = (
-                "📡 Test signali yuborildi. Televizorda reaksiya bo'ldimi "
-                "(ovoz o'zgardi / ekranda belgi chiqdi)?"
+                "📡 Тестовый сигнал отправлен. Телевизор отреагировал "
+                "(изменилась громкость, появился значок на экране)?"
             )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("BMS Smart IR TV test send failed: %s", err)
-            self._test_status = f"⚠️ Yuborishda xato: {err}"
+        else:
+            self._test_status = "⚠️ Не удалось отправить — проверьте связь с Broadlink."
 
     async def async_step_tv_finish(
         self, user_input: dict[str, Any] | None = None
@@ -768,12 +801,7 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
             self._data[CONF_MODEL] = self._current_model
             if user_input.get(CONF_AREA):
                 self._data[CONF_AREA] = user_input[CONF_AREA]
-            unique_id = (
-                f"{DEVICE_TYPE_MEDIA_PLAYER}_"
-                f"{self._data[CONF_HOST]}_"
-                f"{self._working_code}"
-            )
-            await self.async_set_unique_id(unique_id)
+            await self.async_set_unique_id(appliance_unique_id(self._data))
             self._abort_if_unique_id_configured()
             return self.async_create_entry(title=self._data[CONF_NAME], data=self._data)
 
@@ -948,9 +976,9 @@ class BmsSmartIROptionsFlow(OptionsFlow):
         return os.path.dirname(__file__)
 
     async def _send_test(self, device_type: str, code: str) -> None:
-        data = await async_ensure_code_file(self.hass, self._dir, device_type, code)
+        data = await async_load_code(self.hass, device_type, code)
         if not data:
-            self._status = "⚠️ Kod faylini yuklab bo'lmadi."
+            self._status = "⚠️ Не удалось загрузить файл кода."
             return
         commands = data.get("commands", {})
         if device_type == DEVICE_TYPE_MEDIA_PLAYER:
@@ -968,24 +996,24 @@ class BmsSmartIROptionsFlow(OptionsFlow):
                     command = value
                     break
         if not command:
-            self._status = "⚠️ Bu kodda yuboriladigan komanda topilmadi."
+            self._status = "⚠️ В этом коде нет команды для отправки."
             return
         cur = self.config_entry.data
-        controller = BroadlinkIRController(
+        sent = await async_send_test(
             self.hass,
             cur[CONF_HOST],
-            data.get("commandsEncoding", "Base64"),
-            cur.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
+            _decode(command, data.get("commandsEncoding", "Base64")) or b"",
+            port=cur.get(CONF_PORT, DEFAULT_PORT),
+            timeout=cur.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
         )
-        try:
-            await controller.send(command)
+        if sent:
             self._status = (
-                f"📡 #{code} sinov signali yuborildi. Ishladimi? Ha bo'lsa — "
-                "'Sinab ko'rish' belgisini olib, Submit bosing (saqlanadi). "
-                "Yo'q bo'lsa — boshqa kodni tanlang."
+                f"📡 Отправлен тестовый сигнал кода #{code}. Сработало? Тогда снимите "
+                "галочку «Проверить» и нажмите «Отправить» — код сохранится. "
+                "Не сработало — выберите другой код."
             )
-        except Exception as err:  # noqa: BLE001
-            self._status = f"⚠️ Yuborishda xato: {err}"
+        else:
+            self._status = "⚠️ Не удалось отправить — проверьте связь с Broadlink."
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -1000,9 +1028,7 @@ class BmsSmartIROptionsFlow(OptionsFlow):
         manufacturer = data.get(CONF_MANUFACTURER)
 
         if not self._catalog:
-            self._catalog = await self.hass.async_add_executor_job(
-                build_catalog, self._dir, device_type, controller_name
-            )
+            self._catalog = await _catalog_map(self.hass, device_type, controller_name)
         candidates = self._catalog.get(manufacturer, [])
         current = {**data, **self.config_entry.options}
         current_code = current.get(CONF_DEVICE_CODE)

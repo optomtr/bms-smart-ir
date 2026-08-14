@@ -1,8 +1,8 @@
-"""Climate platform for BMS IR."""
+"""An air conditioner in front of a Broadlink."""
+
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -14,37 +14,28 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_TEMPERATURE,
     STATE_OFF,
-    STATE_ON,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
     UnitOfTemperature,
 )
 from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
 
+from .codes import async_load_code
 from .const import (
     CONF_DEVICE_CODE,
     CONF_HUMIDITY_SENSOR,
-    CONF_MANUFACTURER,
-    CONF_MODEL,
-    CONF_HOST,
-    CONF_NAME,
     CONF_POWER_SENSOR,
     CONF_TEMPERATURE_SENSOR,
-    CONF_TIMEOUT,
-    DEFAULT_TIMEOUT,
     DEVICE_TYPE_CLIMATE,
-    DOMAIN,
 )
-from .controller import BroadlinkIRController
-from .device_data import async_ensure_code_file
+from .entity import BmsIrEntity
+from .hub import BroadlinkHub
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__package__)
 
-# Map the strings used in the code files to Home Assistant HVAC modes.
 HVAC_MODE_MAP = {
     "off": HVACMode.OFF,
     "heat": HVACMode.HEAT,
@@ -55,7 +46,6 @@ HVAC_MODE_MAP = {
     "fan_only": HVACMode.FAN_ONLY,
     "fan": HVACMode.FAN_ONLY,
 }
-# Reverse lookup: HVAC mode -> the key used inside the "commands" dict.
 HVAC_KEY_MAP = {
     HVACMode.HEAT: "heat",
     HVACMode.COOL: "cool",
@@ -68,44 +58,30 @@ HVAC_KEY_MAP = {
 OFF_STATES = (STATE_OFF, STATE_UNKNOWN, STATE_UNAVAILABLE, "off", None)
 
 
-async def async_build_climate(hass: HomeAssistant, entry: ConfigEntry):
-    """Build the Broadlink SmartIR climate entity (or None on failure)."""
-    config = {**entry.data, **entry.options}
-    integration_dir = os.path.dirname(__file__)
-    device_code = config[CONF_DEVICE_CODE]
+async def async_build_climate(
+    hass: HomeAssistant, entry: ConfigEntry, hub: BroadlinkHub, config: dict[str, Any]
+) -> BroadlinkClimate:
+    """Build the entity, or make Home Assistant retry.
 
-    device_data = await async_ensure_code_file(
-        hass, integration_dir, DEVICE_TYPE_CLIMATE, device_code
-    )
+    A missing code file used to mean "no entity", which silently broke every
+    automation pointing at it. Refusing to finish setup keeps the entity id
+    registered and unavailable, and Home Assistant retries by itself.
+    """
+    code = config[CONF_DEVICE_CODE]
+    device_data = await async_load_code(hass, DEVICE_TYPE_CLIMATE, code)
     if not device_data:
-        _LOGGER.error("Could not load device code %s — entity not created", device_code)
-        return None
+        raise ConfigEntryNotReady(
+            f"IR code {code} is not available yet (no local copy and no download)"
+        )
+    return BroadlinkClimate(hub, entry, config, device_data)
 
-    return BroadlinkClimate(hass, entry, config, device_data)
 
-
-class BroadlinkClimate(ClimateEntity, RestoreEntity):
+class BroadlinkClimate(BmsIrEntity, ClimateEntity, RestoreEntity):
     """An IR-controlled air conditioner."""
 
-    _attr_has_entity_name = False
-    _attr_should_poll = False
+    def __init__(self, hub, entry, config, device_data) -> None:
+        super().__init__(hub, entry, config, device_data)
 
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        entry: ConfigEntry,
-        config: dict[str, Any],
-        device_data: dict[str, Any],
-    ) -> None:
-        self.hass = hass
-        self._entry = entry
-        self._config = config
-        self._data = device_data
-
-        self._attr_name = config[CONF_NAME]
-        self._attr_unique_id = entry.entry_id
-
-        # ----- Static capabilities pulled from the code file ----------------
         self._commands: dict = device_data.get("commands", {})
         self._precision = float(device_data.get("precision", 1.0))
         self._attr_min_temp = float(device_data.get("minTemperature", 16))
@@ -113,11 +89,10 @@ class BroadlinkClimate(ClimateEntity, RestoreEntity):
         self._attr_target_temperature_step = self._precision
         self._attr_temperature_unit = UnitOfTemperature.CELSIUS
 
-        op_modes = device_data.get("operationModes", [])
+        operation_modes = device_data.get("operationModes", [])
         self._attr_hvac_modes = [HVACMode.OFF] + [
-            HVAC_MODE_MAP[m] for m in op_modes if m in HVAC_MODE_MAP
+            HVAC_MODE_MAP[mode] for mode in operation_modes if mode in HVAC_MODE_MAP
         ]
-
         self._attr_fan_modes = device_data.get("fanModes") or None
         self._attr_swing_modes = device_data.get("swingModes") or None
 
@@ -129,54 +104,32 @@ class BroadlinkClimate(ClimateEntity, RestoreEntity):
             features |= ClimateEntityFeature.SWING_MODE
         self._attr_supported_features = features
 
-        # ----- Dynamic state ------------------------------------------------
         self._attr_hvac_mode = HVACMode.OFF
         self._last_on_mode = next(
-            (m for m in self._attr_hvac_modes if m != HVACMode.OFF), HVACMode.COOL
+            (mode for mode in self._attr_hvac_modes if mode != HVACMode.OFF),
+            HVACMode.COOL,
         )
         self._attr_target_temperature = (self._attr_min_temp + self._attr_max_temp) // 2
-        self._attr_fan_mode = (
-            self._attr_fan_modes[0] if self._attr_fan_modes else None
-        )
+        self._attr_fan_mode = self._attr_fan_modes[0] if self._attr_fan_modes else None
         self._attr_swing_mode = (
             self._attr_swing_modes[0] if self._attr_swing_modes else None
         )
 
-        # ----- Linked sensors ----------------------------------------------
         self._temperature_sensor = config.get(CONF_TEMPERATURE_SENSOR)
         self._humidity_sensor = config.get(CONF_HUMIDITY_SENSOR)
         self._power_sensor = config.get(CONF_POWER_SENSOR)
 
-        # ----- Controller ---------------------------------------------------
-        self._controller = BroadlinkIRController(
-            hass,
-            config[CONF_HOST],
-            device_data.get("commandsEncoding", "Base64"),
-            config.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
-        )
-
-        # ----- Device card --------------------------------------------------
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=config[CONF_NAME],
-            manufacturer=device_data.get("manufacturer", config.get(CONF_MANUFACTURER)),
-            model=config.get(CONF_MODEL) or device_data.get("manufacturer"),
-        )
-
-    # ----------------------------------------------------------------------
-    # Lifecycle
-    # ----------------------------------------------------------------------
+    # ---- lifecycle -------------------------------------------------------
     async def async_added_to_hass(self) -> None:
-        """Restore previous state and start listening to sensors."""
         await super().async_added_to_hass()
 
         if (last := await self.async_get_last_state()) is not None:
-            if last.state in [m.value for m in self._attr_hvac_modes]:
+            if last.state in [mode.value for mode in self._attr_hvac_modes]:
                 self._attr_hvac_mode = HVACMode(last.state)
                 if self._attr_hvac_mode != HVACMode.OFF:
                     self._last_on_mode = self._attr_hvac_mode
-            if (temp := last.attributes.get(ATTR_TEMPERATURE)) is not None:
-                self._attr_target_temperature = float(temp)
+            if (temperature := last.attributes.get(ATTR_TEMPERATURE)) is not None:
+                self._attr_target_temperature = float(temperature)
             if (fan := last.attributes.get("fan_mode")) in (self._attr_fan_modes or []):
                 self._attr_fan_mode = fan
             if (swing := last.attributes.get("swing_mode")) in (
@@ -184,45 +137,48 @@ class BroadlinkClimate(ClimateEntity, RestoreEntity):
             ):
                 self._attr_swing_mode = swing
 
+        for entity_id, handler in (
+            (self._temperature_sensor, self._async_temperature_changed),
+            (self._humidity_sensor, self._async_humidity_changed),
+            (self._power_sensor, self._async_power_changed),
+        ):
+            if entity_id:
+                self.async_on_remove(
+                    async_track_state_change_event(self.hass, entity_id, handler)
+                )
         if self._temperature_sensor:
-            self.async_on_remove(
-                async_track_state_change_event(
-                    self.hass, self._temperature_sensor, self._async_temp_changed
-                )
-            )
-            self._update_current_temp(self.hass.states.get(self._temperature_sensor))
-
+            self._read_temperature(self.hass.states.get(self._temperature_sensor))
         if self._humidity_sensor:
-            self.async_on_remove(
-                async_track_state_change_event(
-                    self.hass, self._humidity_sensor, self._async_humidity_changed
-                )
-            )
-            self._update_current_humidity(self.hass.states.get(self._humidity_sensor))
+            self._read_humidity(self.hass.states.get(self._humidity_sensor))
 
-        if self._power_sensor:
-            self.async_on_remove(
-                async_track_state_change_event(
-                    self.hass, self._power_sensor, self._async_power_changed
-                )
-            )
+    # ---- readings --------------------------------------------------------
+    @property
+    def current_temperature(self) -> float | None:
+        """A linked sensor wins; otherwise the Broadlink's own sensor is used."""
+        if self._temperature_sensor:
+            return self._attr_current_temperature
+        return self._hub.sensors.get("temperature")
 
-    # ----------------------------------------------------------------------
-    # Sensor callbacks
-    # ----------------------------------------------------------------------
+    @property
+    def current_humidity(self) -> float | None:
+        if self._humidity_sensor:
+            return self._attr_current_humidity
+        humidity = self._hub.sensors.get("humidity")
+        return None if humidity is None else int(humidity)
+
     @callback
-    def _async_temp_changed(self, event: Event) -> None:
-        self._update_current_temp(event.data.get("new_state"))
+    def _async_temperature_changed(self, event: Event) -> None:
+        self._read_temperature(event.data.get("new_state"))
         self.async_write_ha_state()
 
     @callback
     def _async_humidity_changed(self, event: Event) -> None:
-        self._update_current_humidity(event.data.get("new_state"))
+        self._read_humidity(event.data.get("new_state"))
         self.async_write_ha_state()
 
     @callback
     def _async_power_changed(self, event: Event) -> None:
-        """Reflect the real on/off state reported by a power sensor."""
+        """Follow a power meter that proves the unit is really off."""
         new_state = event.data.get("new_state")
         if new_state is None:
             return
@@ -230,114 +186,103 @@ class BroadlinkClimate(ClimateEntity, RestoreEntity):
             self._attr_hvac_mode = HVACMode.OFF
             self.async_write_ha_state()
 
-    def _update_current_temp(self, state) -> None:
+    def _read_temperature(self, state) -> None:
         if state and state.state not in OFF_STATES:
             try:
                 self._attr_current_temperature = float(state.state)
             except ValueError:
                 pass
 
-    def _update_current_humidity(self, state) -> None:
+    def _read_humidity(self, state) -> None:
         if state and state.state not in OFF_STATES:
             try:
                 self._attr_current_humidity = float(state.state)
             except ValueError:
                 pass
 
-    # ----------------------------------------------------------------------
-    # Commands
-    # ----------------------------------------------------------------------
+    # ---- commands --------------------------------------------------------
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            "_attr_hvac_mode": self._attr_hvac_mode,
+            "_attr_target_temperature": self._attr_target_temperature,
+            "_attr_fan_mode": self._attr_fan_mode,
+            "_attr_swing_mode": self._attr_swing_mode,
+        }
+
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        if (temp := kwargs.get(ATTR_TEMPERATURE)) is None:
+        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
             return
+        snapshot = self._snapshot()
         if (mode := kwargs.get("hvac_mode")) is not None:
             self._attr_hvac_mode = HVACMode(mode)
-        self._attr_target_temperature = float(temp)
-        await self._send_state()
+        self._attr_target_temperature = float(temperature)
+        await self._async_apply(snapshot)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        snapshot = self._snapshot()
         self._attr_hvac_mode = hvac_mode
         if hvac_mode != HVACMode.OFF:
             self._last_on_mode = hvac_mode
-        await self._send_state()
+        await self._async_apply(snapshot)
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
+        snapshot = self._snapshot()
         self._attr_fan_mode = fan_mode
-        await self._send_state()
+        await self._async_apply(snapshot)
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
+        snapshot = self._snapshot()
         self._attr_swing_mode = swing_mode
-        await self._send_state()
+        await self._async_apply(snapshot)
 
     async def async_turn_on(self) -> None:
+        snapshot = self._snapshot()
         self._attr_hvac_mode = self._last_on_mode
-        await self._send_state()
+        await self._async_apply(snapshot)
 
     async def async_turn_off(self) -> None:
+        snapshot = self._snapshot()
         self._attr_hvac_mode = HVACMode.OFF
-        await self._send_state()
+        await self._async_apply(snapshot)
 
-    async def _send_state(self) -> None:
-        """Look up the right IR code for the current state and transmit it."""
-        command = self._resolve_command()
-        if command is None:
-            _LOGGER.warning(
-                "%s: no IR code for mode=%s fan=%s swing=%s temp=%s",
-                self._attr_name,
-                self._attr_hvac_mode,
-                self._attr_fan_mode,
-                self._attr_swing_mode,
-                self._attr_target_temperature,
-            )
-        else:
-            try:
-                await self._controller.send(command)
-            except Exception as err:  # noqa: BLE001 - surface any transmit error
-                _LOGGER.error("%s: failed to send IR command: %s", self._attr_name, err)
-        self.async_write_ha_state()
+    async def _async_apply(self, snapshot: dict[str, Any]) -> None:
+        """Send the whole state; repeats of it collapse into one transmission."""
+        await self.async_send_with_rollback(
+            self._resolve_command(),
+            snapshot,
+            coalesce_key=f"climate:{self._entry.entry_id}",
+        )
 
-    def _resolve_command(self):
-        """Find the command string for the current state.
-
-        Standard layout is ``commands[mode][fan]([swing])[temperature]`` but
-        the traversal is tolerant of files that omit a level.
-        """
+    # ---- code lookup -----------------------------------------------------
+    def _resolve_command(self) -> str | None:
         if self._attr_hvac_mode == HVACMode.OFF:
             return self._commands.get("off")
 
-        mode_key = HVAC_KEY_MAP.get(self._attr_hvac_mode)
-        node = self._commands.get(mode_key)
+        node = self._commands.get(HVAC_KEY_MAP.get(self._attr_hvac_mode))
+        path = [self._attr_fan_mode, self._attr_swing_mode, *self._temperature_keys()]
+        return self._descend(node, [key for key in path if key is not None])
 
-        temp_keys = self._temperature_keys()
-        path = [self._attr_fan_mode, self._attr_swing_mode, *temp_keys]
-        return self._descend(node, [k for k in path if k is not None])
-
-    def _descend(self, node, keys):
-        """Walk down a nested dict, returning the first string leaf found."""
+    def _descend(self, node: Any, keys: list[str]) -> str | None:
+        """Walk a nested command dict, tolerating files that omit a level."""
         if isinstance(node, str):
             return node
         if not isinstance(node, dict):
             return None
-        # Try matching the next preferred key, then fall back to any temp key
-        # already present in the dict.
         for key in keys:
             if key in node:
                 result = self._descend(node[key], [k for k in keys if k != key])
                 if result is not None:
                     return result
-        # Single-value dict (e.g. only one temperature listed) — descend it.
         if len(node) == 1:
             return self._descend(next(iter(node.values())), keys)
         return None
 
     def _temperature_keys(self) -> list[str]:
-        """Return candidate dict keys for the current target temperature."""
-        temp = self._attr_target_temperature
-        keys = [f"{temp:g}"]
-        if float(temp).is_integer():
-            keys.append(str(int(temp)))
-        keys.append(str(temp))
-        # Deduplicate while preserving order.
+        temperature = self._attr_target_temperature
+        keys = [f"{temperature:g}"]
+        if float(temperature).is_integer():
+            keys.append(str(int(temperature)))
+        keys.append(str(temperature))
         seen: list[str] = []
         for key in keys:
             if key not in seen:
