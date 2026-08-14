@@ -133,6 +133,29 @@ const panel = document.createElement("bms-ir-panel");
 panel.hass = hass;
 document.getElementById("host").appendChild(panel);
 
+// Витрину удобно снимать: #map, #device, #device-charts, #add, +#dark
+const hash = location.hash.replace("#", "");
+if (hash) {
+  const parts = hash.split("+");
+  if (parts.includes("dark")) document.getElementById("dark").click();
+  const view = parts[0];
+  setTimeout(async () => {
+    if (view.startsWith("device")) {
+      panel._go("device", HUBS[0].hub_id);
+      await new Promise((r) => setTimeout(r, 150));
+      if (view.endsWith("charts")) { panel._tab = "charts"; panel._render(); panel._loadHistory(); }
+      if (view.endsWith("appliances")) { panel._tab = "appliances"; panel._render(); }
+    } else if (view === "add-brands") {
+      panel._go("add");
+      panel._add = { step: 3, host: "192.168.1.61:80", device_type: "climate", found: [] };
+      panel._render();
+      await panel._loadCatalog();
+    } else if (view && view !== "overview") {
+      panel._go(view);
+    }
+  }, 200);
+}
+
 document.getElementById("light").onclick = () => {
   document.body.classList.remove("dark");
   document.getElementById("light").classList.add("on");

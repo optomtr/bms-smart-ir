@@ -62,7 +62,7 @@ class BroadlinkOnline(BinarySensorEntity):
         stats = self._hub.stats
         return {
             "статус": self._hub.status,
-            "адрес": self._hub.host,
+            "адрес": self._hub.hub_id,
             "модель": self._hub.model,
             "mac": self._hub.mac_text,
             "команд отправлено": stats.sent,
