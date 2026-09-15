@@ -1,7 +1,11 @@
 """Unified config flow for BMS Smart IR.
 
 Step 1 is a menu: choose the backend.
-  * Broadlink -> the SmartIR-style flow (IP, manufacturer, model, test, finish).
+  * Broadlink -> IP + name, then either "just register the hub" (finishes on
+    the spot, so the panel appears — appliances are then added there, which
+    has its own modern discovery/manufacturer/model flow over the websocket
+    API) or the legacy manufacturer/model/test/finish wizard kept here as a
+    fallback for whoever adds an appliance without the panel.
   * Tuya      -> the cloud flow (hub id, pick remote, test).
 Each branch stores CONF_BACKEND so the rest of the integration knows which
 code path to use.
@@ -75,6 +79,7 @@ from .codes import async_catalog, async_load_code, representative_command
 from .discovery import async_probe, async_send_test, split_host
 from .entity import _decode
 from .helpers import find_bms_creds
+from .hub import hub_key
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -100,6 +105,14 @@ def appliance_unique_id(data: dict[str, Any]) -> str:
             slugify(data[CONF_NAME]),
         ]
     )
+
+
+DEVICE_TYPE_HUB_ONLY = "hub_only"
+
+
+def hub_only_unique_id(host: str, port: int) -> str:
+    """Identity of a bare emitter entry — one per address, no appliance."""
+    return f"hub_{hub_key(host, port)}"
 
 RESULT_WORKED = "worked"
 RESULT_RESEND = "resend"
@@ -235,6 +248,32 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
         self._abort_if_unique_id_configured()
         return self.async_create_entry(title=data[CONF_NAME], data=data)
 
+    async def async_step_import_hub(
+        self, import_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Register a hub the panel found on the network, with one click.
+
+        Same shape as `async_step_hub_only`, just reached from a discovered
+        device instead of a typed-in address — no appliance yet, which is
+        enough for the panel to show it and for the panel to add appliances
+        behind it afterwards.
+        """
+        host = import_data[CONF_HOST]
+        port = import_data.get(CONF_PORT, DEFAULT_PORT)
+        data = {
+            CONF_BACKEND: BACKEND_BROADLINK,
+            CONF_CONTROLLER: CONTROLLER_BROADLINK,
+            CONF_NAME: import_data[CONF_NAME].strip(),
+            CONF_HOST: host,
+            CONF_PORT: port,
+            CONF_TIMEOUT: DEFAULT_TIMEOUT,
+        }
+        await self.async_set_unique_id(hub_only_unique_id(host, port))
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title=f"{data[CONF_NAME]} (Broadlink)", data=data
+        )
+
     # ====================================================================
     # BROADLINK BRANCH
     # ====================================================================
@@ -293,8 +332,10 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_bl_type(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Choose what kind of device to add over Broadlink: AC or TV."""
+        """Choose what kind of device to add over Broadlink: AC, TV, or none yet."""
         if user_input is not None:
+            if user_input["device_type"] == DEVICE_TYPE_HUB_ONLY:
+                return await self.async_step_hub_only()
             self._catalog = {}
             self._manufacturer = ""
             self._failed = set()
@@ -311,6 +352,10 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
             selector.SelectOptionDict(
                 value=DEVICE_TYPE_MEDIA_PLAYER, label="📺 Телевизор"
             ),
+            selector.SelectOptionDict(
+                value=DEVICE_TYPE_HUB_ONLY,
+                label="📡 Только зарегистрировать Broadlink (приборы — в панели)",
+            ),
         ]
         schema = vol.Schema(
             {
@@ -324,6 +369,24 @@ class BmsSmartIRConfigFlow(ConfigFlow, domain=DOMAIN):
             }
         )
         return self.async_show_form(step_id="bl_type", data_schema=schema)
+
+    async def async_step_hub_only(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Register the emitter itself, with no appliance yet.
+
+        This is what makes the sidebar panel appear right after just an IP and
+        a name — without it, a first-time installer had to pick a
+        manufacturer, a model and fire a test signal before the panel (which
+        is where discovery and every later appliance are actually added)
+        existed at all.
+        """
+        host, port = self._data[CONF_HOST], self._data.get(CONF_PORT, DEFAULT_PORT)
+        await self.async_set_unique_id(hub_only_unique_id(host, port))
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title=f"{self._data[CONF_NAME]} (Broadlink)", data=dict(self._data)
+        )
 
     async def async_step_manufacturer(
         self, user_input: dict[str, Any] | None = None

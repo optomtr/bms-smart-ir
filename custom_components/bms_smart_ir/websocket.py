@@ -73,6 +73,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         ws_discover,
         ws_probe,
         ws_test_code,
+        ws_register_hub,
         ws_add_appliance,
         ws_update_appliance,
         ws_remove_appliance,
@@ -104,8 +105,10 @@ def _appliances(
     result = []
     for entry in entries_for_hub(hass, host, port):
         config = {**entry.data, **entry.options}
+        device_type = config.get(CONF_DEVICE_TYPE)
+        if device_type is None:
+            continue  # the hub-only entry itself, not an appliance behind it
         device = registry.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
-        device_type = config.get(CONF_DEVICE_TYPE, DEVICE_TYPE_CLIMATE)
         result.append(
             {
                 "entry_id": entry.entry_id,
@@ -291,6 +294,36 @@ async def ws_probe(hass: HomeAssistant, connection, msg: dict) -> None:
 
 
 # ---- changing the installation -------------------------------------------
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/register_hub",
+        vol.Required("host"): str,
+        vol.Required("name"): vol.All(str, vol.Length(min=1, max=64)),
+        vol.Optional("port", default=DEFAULT_PORT): int,
+    }
+)
+@websocket_api.async_response
+async def ws_register_hub(hass: HomeAssistant, connection, msg: dict) -> None:
+    """Register a Broadlink the discovery screen found, with one click.
+
+    No appliance yet — this alone is enough to make it show up as a device in
+    the panel; appliances are added behind it from there.
+    """
+    host, port = split_host(msg["host"], msg["port"])
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": "import_hub"},
+        data={CONF_HOST: host, CONF_PORT: port, CONF_NAME: msg["name"]},
+    )
+    if result.get("type") != "create_entry":
+        connection.send_error(
+            msg["id"], "add_failed", str(result.get("reason") or "Не удалось добавить")
+        )
+        return
+    connection.send_result(msg["id"], {"entry_id": result["result"].entry_id})
+
+
 @websocket_api.require_admin
 @websocket_api.websocket_command(
     {

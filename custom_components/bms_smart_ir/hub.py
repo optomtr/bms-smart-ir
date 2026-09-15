@@ -35,6 +35,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
     BACKOFF_SECONDS,
+    CONF_MAC,
     DEFAULT_PORT,
     DEFAULT_TIMEOUT,
     DOMAIN,
@@ -42,6 +43,8 @@ from .const import (
     FIRST_HEARTBEAT_DELAY,
     GRACE_SECONDS,
     IR_GAP_MS,
+    MAC_REDISCOVER_AFTER_SECONDS,
+    MAC_REDISCOVER_RETRY_SECONDS,
     MAX_PARALLEL_IO,
     SENSOR_INTERVAL,
     SIGNAL_HUB_UPDATE,
@@ -56,6 +59,7 @@ _LOGGER = logging.getLogger(__package__)
 DATA_HUBS = "hubs"
 DATA_IO_LIMIT = "io_limit"
 DATA_WATCHDOG = "watchdog"
+DATA_SILENT_RELOAD = "silent_reload_skip"
 
 STATUS_CONNECTING = "connecting"
 STATUS_ONLINE = "online"
@@ -95,6 +99,7 @@ class BroadlinkHub:
         port: int = DEFAULT_PORT,
         timeout: int = DEFAULT_TIMEOUT,
         start_delay: float = 0.0,
+        mac: str | None = None,
     ) -> None:
         self.hass = hass
         self.host = host
@@ -105,8 +110,15 @@ class BroadlinkHub:
         # module globals; production always uses the constants.
         self.gap_ms = IR_GAP_MS
         self.sensor_interval = SENSOR_INTERVAL
+        self.mac_rediscover_after = MAC_REDISCOVER_AFTER_SECONDS
+        self.mac_rediscover_retry = MAC_REDISCOVER_RETRY_SECONDS
 
-        self.mac: bytes | None = None
+        # `mac` is a hint from config storage — the last address is not the
+        # identity, the MAC is, so a hub created after a restart can already
+        # know it before ever connecting and try to follow it if the stored
+        # address no longer answers (see `wants_mac_rediscovery`).
+        self.mac: bytes | None = _parse_mac(mac)
+        self._mac_rediscover_attempted_at = 0.0
         self.model: str | None = None
         self.devtype: int | None = None
         self.device_name: str | None = None
@@ -411,7 +423,14 @@ class BroadlinkHub:
     async def _async_connect(self) -> Any:
         loop_device = await self.hass.async_add_executor_job(self._connect_sync)
         self._device = loop_device
-        self.mac = bytes(loop_device.mac)
+        learned_mac = bytes(loop_device.mac)
+        if self.mac != learned_mac:
+            self.mac = learned_mac
+            # Fire-and-forget: keep the MAC in config storage so a restart can
+            # find this box even if its address had already changed while
+            # Home Assistant was off. A slow write must never delay the
+            # connection it is only bookkeeping for.
+            self.hass.async_create_task(_persist_mac(self.hass, self))
         self.model = loop_device.model or loop_device.type
         self.devtype = loop_device.devtype
         self.device_name = loop_device.name or None
@@ -498,6 +517,49 @@ class BroadlinkHub:
             _reconnect(), f"{DOMAIN}_reconnect_{self.host}"
         )
 
+    async def async_force_reconnect(self) -> None:
+        """Connect right now, ignoring backoff — the address itself just moved.
+
+        Used only right after a MAC-based rediscovery: the emitter has already
+        answered a fresh probe at this address, so there is no reason to sit
+        through the accumulated backoff meant for a box that is still gone.
+
+        Unconditionally drops any existing `_device` first. The `broadlink`
+        library binds one to a fixed host/port at construction, so a session
+        opened before the move points at the OLD address regardless of what
+        `self.host`/`self.port` say now — reusing it would silently keep
+        talking to a place nobody is answering anymore.
+        """
+        if self._connect_task is not None:
+            self._connect_task.cancel()
+            self._connect_task = None
+        self._backoff_index = 0
+        async with self._io_lock:
+            self._device = None
+            try:
+                await self._async_connect()
+                self.stats.reconnects += 1
+            except Exception as err:  # noqa: BLE001 - the watchdog retries later
+                self._record_error(err)
+
+    # ---- following an address change --------------------------------------
+    def wants_mac_rediscovery(self) -> bool:
+        """True once a hub has been dark long enough to be worth a scan.
+
+        Requires a MAC on file — learned from a past connection, or seeded
+        from config storage at startup — since the MAC is the only thing about
+        a Broadlink a new DHCP lease does not change.
+        """
+        if self.mac is None or self._status == STATUS_ONLINE:
+            return False
+        now = time.monotonic()
+        if now - self._since < self.mac_rediscover_after:
+            return False
+        return now - self._mac_rediscover_attempted_at >= self.mac_rediscover_retry
+
+    def note_mac_rediscovery_attempt(self) -> None:
+        self._mac_rediscover_attempted_at = time.monotonic()
+
 
 # ---- registry ------------------------------------------------------------
 def _domain_data(hass: HomeAssistant) -> dict[str, Any]:
@@ -528,9 +590,20 @@ def async_hubs(hass: HomeAssistant) -> dict[str, BroadlinkHub]:
 
 
 async def async_get_hub(
-    hass: HomeAssistant, host: str, *, port: int = DEFAULT_PORT, timeout: int = DEFAULT_TIMEOUT
+    hass: HomeAssistant,
+    host: str,
+    *,
+    port: int = DEFAULT_PORT,
+    timeout: int = DEFAULT_TIMEOUT,
+    mac: str | None = None,
 ) -> BroadlinkHub:
-    """Return the hub for an address, creating and starting it once."""
+    """Return the hub for an address, creating and starting it once.
+
+    `mac` seeds a freshly created hub with the last MAC known for this
+    address (from config storage) so it can try to follow the box by MAC even
+    if it never manages to connect at the stored address at all — the case of
+    a lease renewing while Home Assistant itself was restarting.
+    """
     hubs = async_hubs(hass)
     key = hub_key(host, port)
     hub = hubs.get(key)
@@ -541,6 +614,7 @@ async def async_get_hub(
             port=port,
             timeout=timeout,
             start_delay=len(hubs) * STARTUP_STAGGER,
+            mac=mac,
         )
         hubs[key] = hub
         await hub.async_start()
@@ -581,6 +655,10 @@ async def async_start_watchdog(hass: HomeAssistant) -> None:
                 )
             for hub in hubs:
                 await hub.async_ensure_connection()
+            for hub in waiting:
+                if hub.wants_mac_rediscovery():
+                    hub.note_mac_rediscovery_attempt()
+                    await _try_follow_mac(hass, hub)
 
     data[DATA_WATCHDOG] = hass.async_create_background_task(
         _watch(), f"{DOMAIN}_watchdog"
@@ -592,3 +670,61 @@ async def async_stop_watchdog(hass: HomeAssistant) -> None:
     task = data.pop(DATA_WATCHDOG, None)
     if task is not None:
         task.cancel()
+
+
+async def _try_follow_mac(hass: HomeAssistant, hub: BroadlinkHub) -> None:
+    """Deferred import: rediscovery.py needs the device-registry helpers in
+    hub_device.py, which import from this module at its top level — importing
+    it here, long after both modules have finished loading, avoids the cycle.
+    """
+    from .rediscovery import async_follow_mac
+
+    try:
+        await async_follow_mac(hass, hub)
+    except Exception:  # noqa: BLE001 - a failed scan must not kill the watchdog
+        _LOGGER.exception("%s: ошибка при поиске устройства по MAC", hub.hub_id)
+
+
+# ---- silent config-entry updates ------------------------------------------
+# A background move (this module following a hub's MAC to a new address) must
+# not flash every entity behind it unavailable the way a normal reload would.
+# The entities already read the emitter's address off the live hub object
+# (see entity.py), so only config storage and the device registry need to
+# catch up — `async_mark_silent_reload` tells the update listener in
+# __init__.py to skip the reload it would otherwise always do.
+@callback
+def async_mark_silent_reload(hass: HomeAssistant, entry_id: str) -> None:
+    _domain_data(hass).setdefault(DATA_SILENT_RELOAD, set()).add(entry_id)
+
+
+@callback
+def async_pop_silent_reload(hass: HomeAssistant, entry_id: str) -> bool:
+    """Consume the flag above. True means: skip the reload for this update."""
+    pending = _domain_data(hass).get(DATA_SILENT_RELOAD)
+    if not pending or entry_id not in pending:
+        return False
+    pending.discard(entry_id)
+    return True
+
+
+def _parse_mac(mac: str | None) -> bytes | None:
+    if not mac:
+        return None
+    try:
+        return bytes.fromhex(mac.replace(":", ""))
+    except ValueError:
+        _LOGGER.warning("Некорректный MAC в конфигурации: %s", mac)
+        return None
+
+
+async def _persist_mac(hass: HomeAssistant, hub: BroadlinkHub) -> None:
+    """Write a newly learned MAC into every entry behind this hub, silently."""
+    from .hub_device import entries_for_hub  # deferred: avoids a hub<->hub_device cycle
+
+    for entry in entries_for_hub(hass, hub.host, hub.port):
+        if entry.data.get(CONF_MAC) == hub.mac_text:
+            continue
+        async_mark_silent_reload(hass, entry.entry_id)
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_MAC: hub.mac_text}
+        )

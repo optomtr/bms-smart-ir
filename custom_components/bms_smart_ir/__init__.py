@@ -33,6 +33,7 @@ from .const import (
     CONF_HOST,
     CONF_INFRARED_ID,
     CONF_KIND,
+    CONF_MAC,
     CONF_PORT,
     CONF_TIMEOUT,
     DEFAULT_PORT,
@@ -43,8 +44,13 @@ from .const import (
 )
 from .coordinator import IRACoordinator
 from .helpers import find_bms_creds
-from .hub import async_get_hub, async_release_hub, async_stop_watchdog
-from .hub_device import async_register_hub_device
+from .hub import (
+    async_get_hub,
+    async_pop_silent_reload,
+    async_release_hub,
+    async_stop_watchdog,
+)
+from .hub_device import async_register_hub_device, entries_for_hub
 from .panel import async_setup_panel
 from .websocket import async_register_websocket_api
 
@@ -55,9 +61,15 @@ DATA_ENTRIES = "entries"
 
 def _platforms_for(entry: ConfigEntry) -> list[Platform]:
     if entry.data.get(CONF_BACKEND) == BACKEND_BROADLINK:
+        device_type = entry.data.get(CONF_DEVICE_TYPE)
+        if device_type is None:
+            # A hub-only entry: it registers the emitter itself so the panel
+            # exists, with no appliance yet — those are added from the panel.
+            # Only its own sensors (temperature/humidity/link) apply.
+            return [Platform.SENSOR, Platform.BINARY_SENSOR]
         appliance = (
             Platform.MEDIA_PLAYER
-            if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_MEDIA_PLAYER
+            if device_type == DEVICE_TYPE_MEDIA_PLAYER
             else Platform.CLIMATE
         )
         # Sensors belong to the emitter; only its owning entry creates them,
@@ -84,12 +96,26 @@ async def _setup_broadlink(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     host = config.get(CONF_HOST)
     if not host:
         raise ConfigEntryNotReady("No Broadlink address configured")
+    port = config.get(CONF_PORT, DEFAULT_PORT)
 
+    # A fresh hub is seeded with the best MAC any sibling entry remembers, so
+    # it can try to follow the box by MAC even if the stored address does not
+    # answer even once — the lease could have renewed while Home Assistant
+    # itself was restarted, not just while it was running.
+    known_mac = next(
+        (
+            sibling.data[CONF_MAC]
+            for sibling in entries_for_hub(hass, host, port)
+            if sibling.data.get(CONF_MAC)
+        ),
+        None,
+    )
     hub = await async_get_hub(
         hass,
         host,
-        port=config.get(CONF_PORT, DEFAULT_PORT),
+        port=port,
         timeout=config.get(CONF_TIMEOUT, DEFAULT_TIMEOUT),
+        mac=known_mac,
     )
     hass.data[DOMAIN][DATA_ENTRIES][entry.entry_id] = {"hub": hub, "config": config}
 
@@ -198,4 +224,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    if async_pop_silent_reload(hass, entry.entry_id):
+        # A background move (hub.py following this emitter's MAC to a new
+        # address, or just persisting a newly learned MAC) already applied
+        # itself to the running hub — reloading would only flash every entity
+        # behind it unavailable for a change nothing here actually needs.
+        return
     await hass.config_entries.async_reload(entry.entry_id)

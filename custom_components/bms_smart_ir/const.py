@@ -87,6 +87,16 @@ UPTIME_SAMPLES = 500
 
 SIGNAL_HUB_UPDATE = "bms_smart_ir_hub_{}"
 
+MAC_REDISCOVER_AFTER_SECONDS = 180
+"""How long a hub must be unreachable at its known address before the watchdog
+tries to find it elsewhere by MAC. Long enough that an ordinary Wi-Fi blip
+never fires a network broadcast — this is for a box whose DHCP lease renewed
+with a different address while it was otherwise fine."""
+
+MAC_REDISCOVER_RETRY_SECONDS = 300
+"""Cooldown between broadcast scans for one hub, so a box that is genuinely
+gone or truly offline does not get the network swept every watchdog tick."""
+
 CODES_DIR = "codes"
 SMARTIR_RAW_BASE = "https://raw.githubusercontent.com/smartHomeHub/SmartIR/master/codes"
 
