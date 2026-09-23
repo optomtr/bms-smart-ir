@@ -1,28 +1,28 @@
 {
   "domain": "bms_smart_ir",
   "name": "BMS Smart IR",
-  "version": "2.1.0",
-  "config_flow": true,
-  "documentation": "https://github.com/optomtr/bms-smart-ir",
-  "issue_tracker": "https://github.com/optomtr/bms-smart-ir/issues",
-  "codeowners": [
-    "@optomtr"
-  ],
-  "dependencies": [
-    "http",
-    "websocket_api"
-  ],
   "after_dependencies": [
     "panel_custom",
     "recorder",
     "bms_integration"
   ],
-  "requirements": [
-    "broadlink==0.19.0"
+  "codeowners": [
+    "@optomtr"
   ],
+  "config_flow": true,
+  "dependencies": [
+    "http",
+    "websocket_api"
+  ],
+  "documentation": "https://github.com/optomtr/bms-smart-ir",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/optomtr/bms-smart-ir/issues",
   "loggers": [
     "broadlink"
   ],
-  "iot_class": "local_push",
-  "integration_type": "device"
+  "requirements": [
+    "broadlink==0.19.0"
+  ],
+  "version": "2.1.0"
 }
