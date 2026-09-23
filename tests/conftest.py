@@ -27,7 +27,7 @@ import custom_components.bms_smart_ir.config_flow  # noqa: E402,F401
 
 @pytest.fixture(autouse=True)
 def verify_cleanup(
-    event_loop, expected_lingering_tasks: bool, expected_lingering_timers: bool
+    request, expected_lingering_tasks: bool, expected_lingering_timers: bool
 ):
     """The harness' own cleanup check, minus one false alarm.
 
@@ -36,14 +36,22 @@ def verify_cleanup(
     with no code of ours involved at all. Everything else the harness checks
     (lingering tasks, timers, extra instances, and any other stray thread)
     still fails the test, which is what catches a hub task we forgot to stop.
+
+    Older harnesses (Home Assistant 2025.x) take the loop as `event_loop`;
+    newer ones (2026.x, where that fixture no longer exists) find it
+    themselves. The upstream signature decides, so both generations work.
     """
+    import inspect
+
     from pytest_homeassistant_custom_component.plugins import (
         verify_cleanup as upstream,
     )
 
-    checker = upstream.__wrapped__(
-        event_loop, expected_lingering_tasks, expected_lingering_timers
-    )
+    wants_loop = "event_loop" in inspect.signature(upstream.__wrapped__).parameters
+    args = (expected_lingering_tasks, expected_lingering_timers)
+    if wants_loop:
+        args = (request.getfixturevalue("event_loop"), *args)
+    checker = upstream.__wrapped__(*args)
     next(checker)
     yield
     try:
